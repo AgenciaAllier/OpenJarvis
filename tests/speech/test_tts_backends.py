@@ -410,7 +410,13 @@ class _FakeKModel:
 
 
 def _serve_kokoro_importing_spacy(
-    monkeypatch, kpipeline, *, missing_dep=None, import_error=None, block_spacy=False
+    monkeypatch,
+    kpipeline,
+    *,
+    missing_dep=None,
+    import_error=None,
+    block_spacy=False,
+    after_spacy=None,
 ):
     """Serve a fake ``kokoro`` that imports spaCy on load, like the real one
     (``kokoro.pipeline`` -> ``misaki.en`` -> ``spacy``)."""
@@ -432,6 +438,8 @@ def _serve_kokoro_importing_spacy(
                 raise ImportError("spaCy native dependency blocked", name="spacy")
             import spacy  # noqa: F401
 
+            if after_spacy:
+                after_spacy(spacy)
             if import_error:
                 raise import_error
             if missing_dep:
@@ -486,6 +494,7 @@ def test_kokoro_degraded_import_gives_actionable_english_error(monkeypatch):
 
 
 def test_kokoro_restores_spacy_after_non_import_error(monkeypatch):
+    import builtins
     import sys
 
     from openjarvis.speech.kokoro_tts import _import_kokoro
@@ -494,9 +503,70 @@ def test_kokoro_restores_spacy_after_non_import_error(monkeypatch):
         monkeypatch, object, import_error=ValueError("bad model config")
     )
     monkeypatch.setitem(sys.modules, "spacy", None)
+    original_import = builtins.__import__
     with pytest.raises(ValueError, match="bad model config"):
         _import_kokoro()
     assert sys.modules["spacy"] is None
+    assert builtins.__import__ is original_import
+
+
+def test_kokoro_fallback_does_not_publish_spacy_to_other_threads(monkeypatch):
+    """A plain import outside the fallback must see the real failed import."""
+    import builtins
+    import sys
+    import threading
+
+    from openjarvis.speech.kokoro_tts import _import_kokoro
+
+    entered = threading.Event()
+    release = threading.Event()
+    loaded_shims = []
+    retained_importers = []
+    retained_import_errors = []
+    errors = []
+
+    def pause_fallback(spacy):
+        loaded_shims.append(spacy)
+        retained_importers.append(builtins.__import__)
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release Kokoro import")
+
+    _serve_kokoro_importing_spacy(
+        monkeypatch, object, block_spacy=True, after_spacy=pause_fallback
+    )
+    monkeypatch.setitem(sys.modules, "spacy", None)
+    monkeypatch.delitem(sys.modules, "spacy")
+    original_import = builtins.__import__
+
+    def load():
+        try:
+            _import_kokoro()
+            # Even a hook captured by third-party code must stop substituting
+            # once the fallback ends, including on the original owner thread.
+            try:
+                retained_importers[0]("spacy")
+            except ImportError as exc:
+                retained_import_errors.append(exc)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=load)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        # This thread does not acquire our Kokoro-only import lock.
+        with pytest.raises(ImportError, match="spaCy native dependency blocked"):
+            __import__("spacy")
+        assert "spacy" not in sys.modules
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert not errors
+    assert len(loaded_shims) == 1
+    assert len(retained_import_errors) == 1
+    assert builtins.__import__ is original_import
 
 
 def test_concurrent_kokoro_imports_do_not_leave_a_fake_spacy_module(monkeypatch):

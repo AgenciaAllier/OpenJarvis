@@ -13,6 +13,7 @@ female (prefix ``z`` → ``lang_code="z"``).
 
 from __future__ import annotations
 
+import builtins
 import io
 import logging
 import sys
@@ -44,7 +45,6 @@ _VOICE_PREFIX_TO_LANG: Dict[str, str] = {
 _DEFAULT_LANG_CODE = "a"
 _DEFAULT_VOICE_ID = "af_heart"
 _IMPORT_LOCK = threading.RLock()
-_MISSING_MODULE = object()
 
 
 def _import_kokoro() -> Any:
@@ -57,8 +57,8 @@ def _import_kokoro() -> Any:
     it. When spaCy is the culprit, stub it so espeak-based voices (e.g.
     ``pf_dora``) keep working; English pipelines then fail on first use.
     """
-    # Several backend instances may probe health at once. A temporary shim
-    # must not be mistaken for a healthy spaCy import by another probe.
+    # Serialize hook installation across backend instances. The replacement
+    # module is visible only to this thread, never through sys.modules.
     with _IMPORT_LOCK:
         try:
             import kokoro
@@ -71,20 +71,31 @@ def _import_kokoro() -> Any:
                 spacy_error = spacy_exc
             else:
                 raise exc from None
-            previous = sys.modules.get("spacy", _MISSING_MODULE)
             shim = types.ModuleType("spacy")
-            sys.modules["spacy"] = shim
+            owner = threading.get_ident()
+            original_import = builtins.__import__
+            active = True
+
+            def fallback_import(name, globals=None, locals=None, fromlist=(), level=0):
+                if (
+                    active
+                    and threading.get_ident() == owner
+                    and name == "spacy"
+                    and level == 0
+                ):
+                    return shim
+                return original_import(name, globals, locals, fromlist, level)
+
+            builtins.__import__ = fallback_import
             try:
                 import kokoro
             finally:
-                # misaki.en retains its reference for non-English Kokoro use,
-                # but unrelated importers must see the original module state.
-                # Restore it on success and on every kind of import failure.
-                if sys.modules.get("spacy") is shim:
-                    if previous is _MISSING_MODULE:
-                        sys.modules.pop("spacy", None)
-                    else:
-                        sys.modules["spacy"] = previous
+                # misaki.en may retain the private shim for non-English use,
+                # while unrelated threads always use the original importer.
+                # Deactivate even if another hook retained this wrapper.
+                active = False
+                if builtins.__import__ is fallback_import:
+                    builtins.__import__ = original_import
             kokoro._openjarvis_spacy_error = str(spacy_error)
             logger.warning(
                 "spaCy unavailable (%s); English Kokoro voices disabled, "
