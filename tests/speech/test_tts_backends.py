@@ -410,7 +410,7 @@ class _FakeKModel:
 
 
 def _serve_kokoro_importing_spacy(
-    monkeypatch, kpipeline, *, missing_dep=None, import_error=None
+    monkeypatch, kpipeline, *, missing_dep=None, import_error=None, block_spacy=False
 ):
     """Serve a fake ``kokoro`` that imports spaCy on load, like the real one
     (``kokoro.pipeline`` -> ``misaki.en`` -> ``spacy``)."""
@@ -420,7 +420,7 @@ def _serve_kokoro_importing_spacy(
 
     class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         def find_spec(self, name, path=None, target=None):
-            if name != "kokoro":
+            if name != "kokoro" and not (block_spacy and name == "spacy"):
                 return None
             return importlib.util.spec_from_loader(name, self)
 
@@ -428,6 +428,8 @@ def _serve_kokoro_importing_spacy(
             return None
 
         def exec_module(self, module):
+            if module.__name__ == "spacy":
+                raise ImportError("spaCy native dependency blocked", name="spacy")
             import spacy  # noqa: F401
 
             if import_error:
@@ -495,6 +497,54 @@ def test_kokoro_restores_spacy_after_non_import_error(monkeypatch):
     with pytest.raises(ValueError, match="bad model config"):
         _import_kokoro()
     assert sys.modules["spacy"] is None
+
+
+def test_concurrent_kokoro_imports_do_not_leave_a_fake_spacy_module(monkeypatch):
+    import sys
+    import threading
+
+    from openjarvis.speech.kokoro_tts import _import_kokoro
+
+    _serve_kokoro_importing_spacy(monkeypatch, object, block_spacy=True)
+    monkeypatch.setitem(sys.modules, "spacy", None)
+    monkeypatch.delitem(sys.modules, "spacy")
+    results = []
+    errors = []
+
+    def load():
+        try:
+            results.append(_import_kokoro())
+        except Exception as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=load) for _ in range(8)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+    assert not errors
+    assert len(results) == 8
+    assert len({id(result) for result in results}) == 1
+    assert "spacy" not in sys.modules
+    with pytest.raises(ImportError, match="spaCy native dependency blocked"):
+        __import__("spacy")
+
+
+def test_kokoro_preserves_healthy_spacy_when_another_dependency_is_missing(
+    monkeypatch,
+):
+    import sys
+    import types
+
+    from openjarvis.speech.kokoro_tts import _import_kokoro
+
+    real_spacy = types.ModuleType("spacy")
+    monkeypatch.setitem(sys.modules, "spacy", real_spacy)
+    _serve_kokoro_importing_spacy(monkeypatch, object, missing_dep="torch")
+    with pytest.raises(ModuleNotFoundError, match="torch"):
+        _import_kokoro()
+    assert sys.modules["spacy"] is real_spacy
 
 
 def test_kokoro_health_and_pipeline_share_one_model(monkeypatch):
