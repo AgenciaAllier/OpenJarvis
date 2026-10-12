@@ -409,7 +409,9 @@ class _FakeKModel:
         return self
 
 
-def _serve_kokoro_importing_spacy(monkeypatch, kpipeline, *, missing_dep=None):
+def _serve_kokoro_importing_spacy(
+    monkeypatch, kpipeline, *, missing_dep=None, import_error=None
+):
     """Serve a fake ``kokoro`` that imports spaCy on load, like the real one
     (``kokoro.pipeline`` -> ``misaki.en`` -> ``spacy``)."""
     import importlib.abc
@@ -428,6 +430,8 @@ def _serve_kokoro_importing_spacy(monkeypatch, kpipeline, *, missing_dep=None):
         def exec_module(self, module):
             import spacy  # noqa: F401
 
+            if import_error:
+                raise import_error
             if missing_dep:
                 raise ModuleNotFoundError(
                     f"No module named {missing_dep!r}", name=missing_dep
@@ -461,7 +465,82 @@ def test_kokoro_tolerates_unloadable_spacy_for_non_english_voices(monkeypatch):
     KokoroTTSBackend(device="cpu")._ensure_pipeline("p")
 
     assert pipelines == ["p"]
-    assert not hasattr(sys.modules["spacy"], "load")  # a stub, not real spaCy
+    assert sys.modules["spacy"] is None  # No fake global module after success.
+    with pytest.raises(ModuleNotFoundError):
+        __import__("spacy")
+
+
+def test_kokoro_degraded_import_gives_actionable_english_error(monkeypatch):
+    import sys
+
+    from openjarvis.speech.kokoro_tts import KokoroTTSBackend
+
+    _serve_kokoro_importing_spacy(monkeypatch, object)
+    monkeypatch.setitem(sys.modules, "spacy", None)
+    backend = KokoroTTSBackend(device="cpu")
+    assert backend.health() is True
+    with pytest.raises(RuntimeError, match="English Kokoro voices require.*spaCy"):
+        backend._ensure_pipeline("b")
+
+
+def test_kokoro_restores_spacy_after_non_import_error(monkeypatch):
+    import sys
+
+    from openjarvis.speech.kokoro_tts import _import_kokoro
+
+    _serve_kokoro_importing_spacy(
+        monkeypatch, object, import_error=ValueError("bad model config")
+    )
+    monkeypatch.setitem(sys.modules, "spacy", None)
+    with pytest.raises(ValueError, match="bad model config"):
+        _import_kokoro()
+    assert sys.modules["spacy"] is None
+
+
+def test_kokoro_health_and_pipeline_share_one_model(monkeypatch):
+    import sys
+    import threading
+    import time
+    import types
+
+    from openjarvis.speech.kokoro_tts import KokoroTTSBackend
+
+    models = []
+    errors = []
+
+    class SlowModel(_FakeKModel):
+        def __init__(self):
+            models.append(self)
+            time.sleep(0.02)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "kokoro",
+        types.SimpleNamespace(
+            KModel=SlowModel,
+            KPipeline=lambda **kwargs: kwargs["model"],
+        ),
+    )
+    backend = KokoroTTSBackend(device="cpu")
+
+    def load(index):
+        try:
+            if index % 2:
+                assert backend.health()
+            else:
+                backend._ensure_pipeline("p")
+        except Exception as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=load, args=(i,)) for i in range(8)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+    assert not errors
+    assert len(models) == 1
+    assert backend._pipelines["p"] is models[0]
 
 
 def test_kokoro_unloadable_spacy_stub_is_removed_if_kokoro_still_fails(

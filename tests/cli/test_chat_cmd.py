@@ -199,7 +199,10 @@ class TestVoiceInput:
         discover.assert_called_once()
         assert backend.transcribe.call_count == 2
 
-    @pytest.mark.parametrize(("language", "expected"), [("pt", "pt"), ("", None)])
+    @pytest.mark.parametrize(
+        ("language", "expected"),
+        [("pt", "pt"), (" pt ", "pt"), ("", None), ("   ", None)],
+    )
     def test_configured_speech_language_is_passed_to_stt(
         self, language: str, expected: str | None
     ) -> None:

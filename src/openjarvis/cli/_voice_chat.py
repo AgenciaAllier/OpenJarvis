@@ -63,7 +63,7 @@ class VoiceSession:
         from openjarvis.core.config import load_config
 
         config = self._config if self._config is not None else load_config()
-        return getattr(config.speech, "language", "") or None
+        return (getattr(config.speech, "language", "") or "").strip() or None
 
     def get_tts_backend(self) -> Any:
         """Return a cached healthy TTS backend, falling through once per key."""

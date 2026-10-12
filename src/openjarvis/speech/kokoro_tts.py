@@ -43,6 +43,8 @@ _VOICE_PREFIX_TO_LANG: Dict[str, str] = {
 
 _DEFAULT_LANG_CODE = "a"
 _DEFAULT_VOICE_ID = "af_heart"
+_IMPORT_LOCK = threading.RLock()
+_MISSING_MODULE = object()
 
 
 def _import_kokoro() -> Any:
@@ -55,29 +57,41 @@ def _import_kokoro() -> Any:
     it. When spaCy is the culprit, stub it so espeak-based voices (e.g.
     ``pf_dora``) keep working; English pipelines then fail on first use.
     """
-    try:
-        import kokoro
-    except ImportError as exc:
-        if exc.name == "kokoro" or sys.modules.get("spacy") is not None:
-            raise
-        try:
-            import spacy  # noqa: F401
-        except ImportError as spacy_exc:
-            spacy_error = spacy_exc
-        else:
-            raise exc from None
-        sys.modules["spacy"] = types.ModuleType("spacy")
+    # Several backend instances may probe health at once. A temporary shim
+    # must not be mistaken for a healthy spaCy import by another probe.
+    with _IMPORT_LOCK:
         try:
             import kokoro
-        except ImportError:
-            del sys.modules["spacy"]
-            raise
-        logger.warning(
-            "spaCy unavailable (%s); English Kokoro voices disabled, "
-            "other languages still work",
-            spacy_error,
-        )
-    return kokoro
+        except ImportError as exc:
+            if exc.name == "kokoro" or sys.modules.get("spacy") is not None:
+                raise
+            try:
+                import spacy  # noqa: F401
+            except ImportError as spacy_exc:
+                spacy_error = spacy_exc
+            else:
+                raise exc from None
+            previous = sys.modules.get("spacy", _MISSING_MODULE)
+            shim = types.ModuleType("spacy")
+            sys.modules["spacy"] = shim
+            try:
+                import kokoro
+            finally:
+                # misaki.en retains its reference for non-English Kokoro use,
+                # but unrelated importers must see the original module state.
+                # Restore it on success and on every kind of import failure.
+                if sys.modules.get("spacy") is shim:
+                    if previous is _MISSING_MODULE:
+                        sys.modules.pop("spacy", None)
+                    else:
+                        sys.modules["spacy"] = previous
+            kokoro._openjarvis_spacy_error = str(spacy_error)
+            logger.warning(
+                "spaCy unavailable (%s); English Kokoro voices disabled, "
+                "other languages still work",
+                spacy_error,
+            )
+        return kokoro
 
 
 @TTSRegistry.register("kokoro")
@@ -126,11 +140,19 @@ class KokoroTTSBackend(TTSBackend):
                 self._pipelines.move_to_end(lang_code)
                 return pipeline
             try:
-                KPipeline = _import_kokoro().KPipeline
+                kokoro = _import_kokoro()
+                KPipeline = kokoro.KPipeline
             except ImportError as exc:
                 raise RuntimeError(
                     "kokoro package not installed. Install with: pip install kokoro"
                 ) from exc
+            if lang_code in {"a", "b"} and getattr(
+                kokoro, "_openjarvis_spacy_error", None
+            ):
+                raise RuntimeError(
+                    "English Kokoro voices require a working spaCy installation: "
+                    f"{kokoro._openjarvis_spacy_error}"
+                )
             try:
                 # KModel is language-blind and is by far the heaviest part of
                 # Kokoro. Reuse one model across every language pipeline.
@@ -297,8 +319,11 @@ class KokoroTTSBackend(TTSBackend):
     def health(self) -> bool:
         # Check the shared model, not the English pipeline: language-specific
         # G2P problems surface at synthesis time for the voice actually used.
-        try:
-            self._ensure_model()
-            return True
-        except RuntimeError:
-            return False
+        # Use the same lock as synthesis so concurrent health probes cannot
+        # allocate duplicate model weights or race with close().
+        with self._pipeline_lock:
+            try:
+                self._ensure_model()
+                return True
+            except RuntimeError:
+                return False
